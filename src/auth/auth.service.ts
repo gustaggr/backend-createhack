@@ -5,6 +5,7 @@ import { generateOpaqueToken, hashToken } from '../common/token.util.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SESSION_TTL_MS } from './auth.constants.js';
 import type { AuthenticatedUser } from './auth.types.js';
+import type { UpdateProfileDto } from './dto/update-profile.dto.js';
 
 const userWithRolesInclude = {
   roles: {
@@ -17,6 +18,7 @@ function toAuthenticatedUser(user: {
   email: string;
   fullName: string;
   preferredName: string | null;
+  phone: string | null;
   roles: Array<{
     id: string;
     role: string;
@@ -30,6 +32,7 @@ function toAuthenticatedUser(user: {
     email: user.email,
     fullName: user.fullName,
     preferredName: user.preferredName,
+    phone: user.phone,
     roles: user.roles.map((r) => ({
       id: r.id,
       role: r.role as AuthenticatedUser['roles'][number]['role'],
@@ -136,5 +139,52 @@ export class AuthService {
       include: userWithRolesInclude,
     });
     return user ? toAuthenticatedUser(user) : null;
+  }
+
+  async updateProfile(userId: string, dto: UpdateProfileDto): Promise<AuthenticatedUser> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('Usuário não encontrado');
+    }
+
+    const dataToUpdate: any = {};
+
+    if (dto.fullName) dataToUpdate.fullName = dto.fullName;
+    if (dto.preferredName !== undefined) dataToUpdate.preferredName = dto.preferredName;
+    if (dto.phone !== undefined) dataToUpdate.phone = dto.phone || null;
+
+    if (dto.newPassword) {
+      if (!dto.currentPassword) {
+        throw new UnauthorizedException('A senha atual é necessária para definir uma nova senha');
+      }
+
+      if (user.passwordHash) {
+        const valid = await bcrypt.compare(dto.currentPassword, user.passwordHash);
+        if (!valid) {
+          throw new UnauthorizedException('Senha atual incorreta');
+        }
+      }
+
+      dataToUpdate.passwordHash = await bcrypt.hash(dto.newPassword, 10);
+    }
+
+    if (Object.keys(dataToUpdate).length > 0) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: dataToUpdate,
+      });
+
+      await this.audit.log({
+        actorUserId: userId,
+        action: 'auth.profile.update',
+        entityType: 'User',
+        entityId: userId,
+      });
+    }
+
+    return this.getById(userId) as Promise<AuthenticatedUser>;
   }
 }

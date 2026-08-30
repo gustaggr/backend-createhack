@@ -36,25 +36,33 @@ export class GroupsService {
     return 'NONE';
   }
 
-  private async assertLeaderBelongsToInstitution(institutionId: string, leaderId: string) {
-    const leaderRole = await this.prisma.userRole.findFirst({
-      where: { userId: leaderId, institutionId, role: 'LEADER', status: 'ACTIVE' },
+  /** Aceita uma lista vazia — um grupo pode não ter nenhum líder designado
+   * (ex.: um grupo puramente institucional, "da escola"). */
+  private async assertLeadersBelongToInstitution(institutionId: string, leaderIds: string[]) {
+    if (leaderIds.length === 0) return;
+
+    const leaderRoles = await this.prisma.userRole.findMany({
+      where: { userId: { in: leaderIds }, institutionId, role: 'LEADER', status: 'ACTIVE' },
+      select: { userId: true },
     });
-    if (!leaderRole) {
-      throw new BadRequestException('Líder informado não pertence a esta instituição');
+    const validIds = new Set(leaderRoles.map((r) => r.userId));
+    const invalid = leaderIds.filter((id) => !validIds.has(id));
+    if (invalid.length > 0) {
+      throw new BadRequestException('Um ou mais líderes informados não pertencem a esta instituição');
     }
   }
 
   async create(institutionId: string, dto: CreateGroupDto, actorUserId: string) {
-    await this.assertLeaderBelongsToInstitution(institutionId, dto.leaderId);
+    const leaderIds = dto.leaderIds ?? [];
+    await this.assertLeadersBelongToInstitution(institutionId, leaderIds);
 
     const group = await this.prisma.group.create({
       data: {
         institutionId,
-        leaderId: dto.leaderId,
         name: dto.name,
         description: dto.description,
         locality: dto.locality,
+        leaders: { create: leaderIds.map((userId) => ({ userId })) },
       },
     });
 
@@ -63,7 +71,7 @@ export class GroupsService {
       action: 'group.create',
       entityType: 'Group',
       entityId: group.id,
-      metadata: { name: dto.name, leaderId: dto.leaderId },
+      metadata: { name: dto.name, leaderIds },
     });
 
     return group;
@@ -76,9 +84,12 @@ export class GroupsService {
     }
 
     const groups = await this.prisma.group.findMany({
-      where: { institutionId, ...(access === 'LEADER' ? { leaderId: actor.id } : {}) },
+      where: {
+        institutionId,
+        ...(access === 'LEADER' ? { leaders: { some: { userId: actor.id } } } : {}),
+      },
       include: {
-        leader: { select: { id: true, fullName: true } },
+        leaders: { include: { user: { select: { id: true, fullName: true } } } },
         _count: { select: { memberships: { where: { status: 'ACTIVE' } } } },
       },
       orderBy: { createdAt: 'asc' },
@@ -90,7 +101,7 @@ export class GroupsService {
       description: g.description,
       locality: g.locality,
       status: g.status,
-      leader: g.leader,
+      leaders: g.leaders.map((l) => l.user),
       memberCount: g._count.memberships,
     }));
   }
@@ -99,7 +110,7 @@ export class GroupsService {
     const group = await this.prisma.group.findUnique({
       where: { id: groupId },
       include: {
-        leader: { select: { id: true, fullName: true, email: true } },
+        leaders: { include: { user: { select: { id: true, fullName: true, email: true } } } },
         memberships: {
           where: { status: 'ACTIVE' },
           include: { missionary: { select: { id: true, fullName: true, email: true } } },
@@ -112,7 +123,8 @@ export class GroupsService {
     }
 
     const access = this.getAccessLevel(actor, group.institutionId);
-    if (access === 'NONE' || (access === 'LEADER' && group.leaderId !== actor.id)) {
+    const isOwnLeader = group.leaders.some((l) => l.userId === actor.id);
+    if (access === 'NONE' || (access === 'LEADER' && !isOwnLeader)) {
       throw new ForbiddenException('Você não pode ver este grupo');
     }
 
@@ -122,51 +134,75 @@ export class GroupsService {
       description: group.description,
       locality: group.locality,
       status: group.status,
-      leader: group.leader,
+      leaders: group.leaders.map((l) => l.user),
       members: group.memberships.map((m) => m.missionary),
-      canReassignLeader: access === 'ADMIN',
+      canManageLeaders: access === 'ADMIN',
     };
   }
 
   async update(groupId: string, dto: UpdateGroupDto, actor: AuthenticatedUser) {
-    const existing = await this.prisma.group.findUnique({ where: { id: groupId } });
+    const existing = await this.prisma.group.findUnique({
+      where: { id: groupId },
+      include: { leaders: true },
+    });
     if (!existing) {
       throw new NotFoundException('Grupo não encontrado');
     }
 
     const access = this.getAccessLevel(actor, existing.institutionId);
-    if (access === 'NONE' || (access === 'LEADER' && existing.leaderId !== actor.id)) {
+    const isOwnLeader = existing.leaders.some((l) => l.userId === actor.id);
+    if (access === 'NONE' || (access === 'LEADER' && !isOwnLeader)) {
       throw new ForbiddenException('Você não pode editar este grupo');
     }
 
-    if (access === 'LEADER' && (dto.leaderId || dto.status)) {
+    if (access === 'LEADER' && (dto.leaderIds !== undefined || dto.status)) {
       throw new ForbiddenException(
         'Líderes só podem editar nome, descrição e localidade do grupo',
       );
     }
 
-    if (dto.leaderId) {
-      await this.assertLeaderBelongsToInstitution(existing.institutionId, dto.leaderId);
+    if (dto.leaderIds !== undefined) {
+      await this.assertLeadersBelongToInstitution(existing.institutionId, dto.leaderIds);
     }
 
-    const group = await this.prisma.group.update({ where: { id: groupId }, data: dto });
+    const { leaderIds, ...rest } = dto;
 
-    if (dto.leaderId && dto.leaderId !== existing.leaderId) {
-      await this.audit.log({
-        actorUserId: actor.id,
-        action: 'group.leader_changed',
-        entityType: 'Group',
-        entityId: group.id,
-        metadata: { previousLeaderId: existing.leaderId, newLeaderId: dto.leaderId },
-      });
-    }
+    const group = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.group.update({ where: { id: groupId }, data: rest });
+
+      if (leaderIds !== undefined) {
+        const previousIds = existing.leaders.map((l) => l.userId);
+        await tx.groupLeader.deleteMany({
+          where: { groupId, userId: { notIn: leaderIds } },
+        });
+        for (const userId of leaderIds) {
+          await tx.groupLeader.upsert({
+            where: { groupId_userId: { groupId, userId } },
+            create: { groupId, userId },
+            update: {},
+          });
+        }
+
+        if (JSON.stringify([...previousIds].sort()) !== JSON.stringify([...leaderIds].sort())) {
+          await this.audit.log({
+            actorUserId: actor.id,
+            action: 'group.leaders_changed',
+            entityType: 'Group',
+            entityId: groupId,
+            metadata: { previousLeaderIds: previousIds, newLeaderIds: leaderIds },
+          });
+        }
+      }
+
+      return updated;
+    });
 
     await this.audit.log({
       actorUserId: actor.id,
       action: 'group.update',
       entityType: 'Group',
       entityId: group.id,
-      metadata: { ...dto },
+      metadata: { ...rest },
     });
 
     return group;

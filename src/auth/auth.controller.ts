@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   HttpCode,
+  Patch,
   Post,
   Req,
   Res,
@@ -13,6 +14,7 @@ import { AuthService } from './auth.service.js';
 import { SESSION_COOKIE_NAME, SESSION_TTL_MS } from './auth.constants.js';
 import { CurrentUser } from './decorators/current-user.decorator.js';
 import { LoginDto } from './dto/login.dto.js';
+import { UpdateProfileDto } from './dto/update-profile.dto.js';
 import type { AuthenticatedRequest } from './guards/session-auth.guard.js';
 import { SessionAuthGuard } from './guards/session-auth.guard.js';
 import type { AuthenticatedUser } from './auth.types.js';
@@ -50,6 +52,13 @@ export class AuthController {
   @UseGuards(SessionAuthGuard)
   me(@CurrentUser() user: AuthenticatedUser) {
     return { user };
+  }
+
+  @Patch('me')
+  @UseGuards(SessionAuthGuard)
+  async updateMe(@CurrentUser() user: AuthenticatedUser, @Body() dto: UpdateProfileDto) {
+    const updatedUser = await this.authService.updateProfile(user.id, dto);
+    return { user: updatedUser };
   }
 }
 

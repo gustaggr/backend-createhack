@@ -57,8 +57,11 @@ export class InvitesService {
       if (!groupId) {
         throw new BadRequestException('Informe o grupo para convidar um membro');
       }
-      const group = await this.prisma.group.findFirst({ where: { id: groupId, institutionId } });
-      if (!group || group.leaderId !== actor.id) {
+      const group = await this.prisma.group.findFirst({
+        where: { id: groupId, institutionId },
+        include: { leaders: true },
+      });
+      if (!group || !group.leaders.some((l) => l.userId === actor.id)) {
         throw new ForbiddenException('Você só pode convidar membros para um grupo que você lidera');
       }
       return;
@@ -118,8 +121,9 @@ export class InvitesService {
     });
 
     const activationLink = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/invite/${rawToken}`;
-    const webhookEndpoint = await this.webhookConfig.getForDispatch();
+    const webhookEndpoint = await this.webhookConfig.getForDispatch('INVITE_CREATED');
     await this.dispatchInviteWebhook(invite.id, webhookEndpoint, {
+      event: 'invite.created',
       link: activationLink,
       email: dto.email,
       fullName: dto.fullName,
@@ -153,8 +157,9 @@ export class InvitesService {
     });
 
     const activationLink = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/invite/${rawToken}`;
-    const webhookEndpoint = await this.webhookConfig.getForDispatch();
+    const webhookEndpoint = await this.webhookConfig.getForDispatch('INVITE_CREATED');
     await this.dispatchInviteWebhook(invite.id, webhookEndpoint, {
+      event: 'invite.created',
       link: activationLink,
       email: invite.email,
       fullName: invite.fullName,

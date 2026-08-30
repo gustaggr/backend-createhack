@@ -92,24 +92,37 @@ enum CareEventStatus {
   CLOSED
 }
 
-model Institution {
-  id               String            @id @default(uuid())
-  name             String
-  displayName      String            @map("display_name")
-  country          String
-  defaultLanguage  String            @map("default_language")
-  timezone         String
-  email            String
-  status           InstitutionStatus @default(ACTIVE)
-  createdAt        DateTime          @default(now()) @map("created_at")
-  updatedAt        DateTime          @updatedAt @map("updated_at")
+enum MaterialType {
+  VIDEO
+  PDF
+}
 
-  userRoles          UserRole[]
-  journeys           MissionaryJourney[]
-  groups             Group[]
-  invites            Invite[]
-  dailyCheckins      DailyCheckin[]
-  careEvents         CareEvent[]
+enum MaterialScope {
+  INDIVIDUAL
+  GROUP
+  LEADER_ALL
+  INSTITUTION
+}
+
+model Institution {
+  id              String            @id @default(uuid())
+  name            String
+  displayName     String            @map("display_name")
+  country         String
+  defaultLanguage String            @map("default_language")
+  timezone        String
+  email           String
+  status          InstitutionStatus @default(ACTIVE)
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  userRoles     UserRole[]
+  journeys      MissionaryJourney[]
+  groups        Group[]
+  invites       Invite[]
+  dailyCheckins DailyCheckin[]
+  careEvents    CareEvent[]
+  materials     Material[]
 
   @@map("institutions")
 }
@@ -129,18 +142,22 @@ model User {
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
 
-  roles                  UserRole[]
-  journeys               MissionaryJourney[]
-  ledGroups              Group[]                 @relation("GroupLeader")
-  groupMemberships       GroupMembership[]       @relation("GroupMissionary")
-  groupMembershipChanges GroupMembership[]       @relation("GroupMembershipChangedBy")
-  invitesCreated         Invite[]                @relation("InvitesCreatedBy")
-  consents               Consent[]
-  sessions               Session[]
-  auditLogs              AuditLog[]
-  dailyCheckins          DailyCheckin[]
-  careEvents             CareEvent[]             @relation("CareEventMissionary")
-  careEventsClosed       CareEvent[]             @relation("CareEventClosedBy")
+  roles                       UserRole[]
+  journeys                    MissionaryJourney[]
+  ledGroups                   GroupLeader[]       @relation("GroupLeaderUser")
+  groupMemberships            GroupMembership[]   @relation("GroupMissionary")
+  groupMembershipChanges      GroupMembership[]   @relation("GroupMembershipChangedBy")
+  invitesCreated              Invite[]            @relation("InvitesCreatedBy")
+  consents                    Consent[]
+  sessions                    Session[]
+  auditLogs                   AuditLog[]
+  dailyCheckins               DailyCheckin[]
+  careEvents                  CareEvent[]         @relation("CareEventMissionary")
+  careEventsClosed            CareEvent[]         @relation("CareEventClosedBy")
+  uploadedMaterials           Material[]          @relation("MaterialUploadedBy")
+  materialsAsMissionaryTarget Material[]          @relation("MaterialMissionary")
+  materialsAsLeaderTarget     Material[]          @relation("MaterialLeader")
+  materialViews               MaterialView[]
 
   @@map("users")
 }
@@ -183,7 +200,6 @@ model MissionaryJourney {
 model Group {
   id            String      @id @default(uuid())
   institutionId String      @map("institution_id")
-  leaderId      String      @map("leader_id")
   name          String
   description   String?
   locality      String?
@@ -192,22 +208,37 @@ model Group {
   updatedAt     DateTime    @updatedAt @map("updated_at")
 
   institution Institution       @relation(fields: [institutionId], references: [id], onDelete: Cascade)
-  leader      User              @relation("GroupLeader", fields: [leaderId], references: [id])
+  leaders     GroupLeader[]
   memberships GroupMembership[]
   invites     Invite[]
+  materials   Material[]
 
   @@map("groups")
 }
 
+// Um grupo pode ter zero, um ou vários líderes (ex.: grupo "da escola" sem
+// liderança pastoral designada, ou co-liderança).
+model GroupLeader {
+  id      String @id @default(uuid())
+  groupId String @map("group_id")
+  userId  String @map("user_id")
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation("GroupLeaderUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@map("group_leaders")
+}
+
 model GroupMembership {
-  id              String                 @id @default(uuid())
-  groupId         String                 @map("group_id")
-  missionaryId    String                 @map("missionary_id")
-  startDate       DateTime               @default(now()) @map("start_date")
-  endDate         DateTime?              @map("end_date")
-  status          GroupMembershipStatus  @default(ACTIVE)
-  changedByUserId String                 @map("changed_by_user_id")
-  createdAt       DateTime               @default(now()) @map("created_at")
+  id              String                @id @default(uuid())
+  groupId         String                @map("group_id")
+  missionaryId    String                @map("missionary_id")
+  startDate       DateTime              @default(now()) @map("start_date")
+  endDate         DateTime?             @map("end_date")
+  status          GroupMembershipStatus @default(ACTIVE)
+  changedByUserId String                @map("changed_by_user_id")
+  createdAt       DateTime              @default(now()) @map("created_at")
 
   group      Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
   missionary User  @relation("GroupMissionary", fields: [missionaryId], references: [id], onDelete: Cascade)
@@ -216,15 +247,64 @@ model GroupMembership {
   @@map("group_memberships")
 }
 
-// Configuração única (singleton) do webhook de convite — vale para toda a
+// Vídeo ou PDF que um líder/diretor/admin sobe (ImageKit) pra um missionário
+// específico, um grupo, todos que o líder lidera, ou toda a instituição.
+model Material {
+  id               String        @id @default(uuid())
+  institutionId    String        @map("institution_id")
+  uploadedByUserId String        @map("uploaded_by_user_id")
+  type             MaterialType
+  title            String
+  description      String?
+  fileUrl          String        @map("file_url")
+  fileId           String        @map("file_id")
+  thumbnailUrl     String?       @map("thumbnail_url")
+  scope            MaterialScope
+  missionaryId     String?       @map("missionary_id")
+  groupId          String?       @map("group_id")
+  leaderId         String?       @map("leader_id")
+  createdAt        DateTime      @default(now()) @map("created_at")
+
+  institution Institution    @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  uploadedBy  User           @relation("MaterialUploadedBy", fields: [uploadedByUserId], references: [id])
+  missionary  User?          @relation("MaterialMissionary", fields: [missionaryId], references: [id], onDelete: Cascade)
+  group       Group?         @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  leader      User?          @relation("MaterialLeader", fields: [leaderId], references: [id])
+  views       MaterialView[]
+
+  @@map("materials")
+}
+
+// Registro de "missionário X abriu/assistiu o material Y" — só a primeira
+// visualização é guardada (viewedAt não é atualizado em views repetidas).
+model MaterialView {
+  id         String   @id @default(uuid())
+  materialId String   @map("material_id")
+  userId     String   @map("user_id")
+  viewedAt   DateTime @default(now()) @map("viewed_at")
+
+  material Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([materialId, userId])
+  @@map("material_views")
+}
+
+enum WebhookEvent {
+  INVITE_CREATED
+  SCORE_ALERT
+}
+
+// Uma configuração por evento (URL + secret próprios) — vale para toda a
 // plataforma, não por instituição. Só o SUPER_ADMIN pode alterá-la.
 model WebhookConfig {
-  id        String   @id @default(uuid())
+  id        String       @id @default(uuid())
+  event     WebhookEvent @unique
   url       String
   secret    String
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  active    Boolean      @default(true)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
 
   @@map("webhook_config")
 }
@@ -265,14 +345,14 @@ model Consent {
 }
 
 model Session {
-  id         String    @id @default(uuid())
-  userId     String    @map("user_id")
-  tokenHash  String    @unique @map("token_hash")
-  userAgent  String?   @map("user_agent")
-  ipAddress  String?   @map("ip_address")
-  createdAt  DateTime  @default(now()) @map("created_at")
-  expiresAt  DateTime  @map("expires_at")
-  revokedAt  DateTime? @map("revoked_at")
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  userAgent String?   @map("user_agent")
+  ipAddress String?   @map("ip_address")
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -280,20 +360,20 @@ model Session {
 }
 
 model Question {
-  id              String             @id @default(uuid())
-  setNumber       Int                @map("set_number")
-  order           Int
-  type            QuestionType       @default(SCORED_CHOICE)
-  dimension       QuestionDimension?
-  text            String
-  options         Json?
-  isRedFlag       Boolean            @default(false) @map("is_red_flag")
+  id             String             @id @default(uuid())
+  setNumber      Int                @map("set_number")
+  order          Int
+  type           QuestionType       @default(SCORED_CHOICE)
+  dimension      QuestionDimension?
+  text           String
+  options        Json?
+  isRedFlag      Boolean            @default(false) @map("is_red_flag")
   // Pergunta condicional: só é exibida/obrigatória se a resposta da pergunta
   // de "order" dependsOnOrder NÃO tiver sido skipWhenOption.
-  dependsOnOrder  Int?               @map("depends_on_order")
-  skipWhenOption  String?            @map("skip_when_option")
-  status          String             @default("ACTIVE")
-  createdAt       DateTime           @default(now()) @map("created_at")
+  dependsOnOrder Int?               @map("depends_on_order")
+  skipWhenOption String?            @map("skip_when_option")
+  status         String             @default("ACTIVE")
+  createdAt      DateTime           @default(now()) @map("created_at")
 
   answers CheckinAnswer[]
 
@@ -302,23 +382,23 @@ model Question {
 }
 
 model DailyCheckin {
-  id                String        @id @default(uuid())
-  missionaryId      String        @map("missionary_id")
-  institutionId     String        @map("institution_id")
-  checkinDate       DateTime      @map("checkin_date") @db.Date
-  setNumber         Int           @map("set_number")
-  status            CheckinStatus @default(PENDING)
-  overallScore      Float?        @map("overall_score")
-  overallBand       ScoreBand?    @map("overall_band")
-  hasCriticalAlert  Boolean       @default(false) @map("has_critical_alert")
-  completedAt       DateTime?     @map("completed_at")
-  createdAt         DateTime      @default(now()) @map("created_at")
+  id               String        @id @default(uuid())
+  missionaryId     String        @map("missionary_id")
+  institutionId    String        @map("institution_id")
+  checkinDate      DateTime      @map("checkin_date") @db.Date
+  setNumber        Int           @map("set_number")
+  status           CheckinStatus @default(PENDING)
+  overallScore     Float?        @map("overall_score")
+  overallBand      ScoreBand?    @map("overall_band")
+  hasCriticalAlert Boolean       @default(false) @map("has_critical_alert")
+  completedAt      DateTime?     @map("completed_at")
+  createdAt        DateTime      @default(now()) @map("created_at")
 
-  missionary        User              @relation(fields: [missionaryId], references: [id], onDelete: Cascade)
-  institution       Institution       @relation(fields: [institutionId], references: [id], onDelete: Cascade)
-  answers           CheckinAnswer[]
-  dimensionScores   DimensionScore[]
-  careEvents        CareEvent[]
+  missionary      User             @relation(fields: [missionaryId], references: [id], onDelete: Cascade)
+  institution     Institution      @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  answers         CheckinAnswer[]
+  dimensionScores DimensionScore[]
+  careEvents      CareEvent[]
 
   @@unique([missionaryId, checkinDate])
   @@map("daily_checkins")
@@ -375,14 +455,14 @@ model CareEvent {
 }
 
 model AuditLog {
-  id           String   @id @default(uuid())
-  actorUserId  String?  @map("actor_user_id")
-  action       String
-  entityType   String   @map("entity_type")
-  entityId     String   @map("entity_id")
-  metadata     Json?
-  ipAddress    String?  @map("ip_address")
-  createdAt    DateTime @default(now()) @map("created_at")
+  id          String   @id @default(uuid())
+  actorUserId String?  @map("actor_user_id")
+  action      String
+  entityType  String   @map("entity_type")
+  entityId    String   @map("entity_id")
+  metadata    Json?
+  ipAddress   String?  @map("ip_address")
+  createdAt   DateTime @default(now()) @map("created_at")
 
   actor User? @relation(fields: [actorUserId], references: [id])
 

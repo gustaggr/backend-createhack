@@ -1,5 +1,5 @@
 import { GroupStatus } from '@prisma/client';
-import { IsEnum, IsOptional, IsString, MinLength } from 'class-validator';
+import { IsArray, IsEnum, IsOptional, IsString, MinLength } from 'class-validator';
 
 export class UpdateGroupDto {
   @IsOptional()
@@ -16,8 +16,9 @@ export class UpdateGroupDto {
   locality?: string;
 
   @IsOptional()
-  @IsString()
-  leaderId?: string;
+  @IsArray()
+  @IsString({ each: true })
+  leaderIds?: string[];
 
   @IsOptional()
   @IsEnum(GroupStatus)

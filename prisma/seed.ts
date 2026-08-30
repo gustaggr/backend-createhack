@@ -205,10 +205,13 @@ async function main() {
     update: {},
   });
 
-  const existingWebhookConfig = await prisma.webhookConfig.findFirst();
+  const existingWebhookConfig = await prisma.webhookConfig.findUnique({
+    where: { event: 'INVITE_CREATED' },
+  });
   if (!existingWebhookConfig) {
     await prisma.webhookConfig.create({
       data: {
+        event: 'INVITE_CREATED',
         url: 'https://webhook.site/replace-me',
         secret: randomBytes(32).toString('hex'),
         active: true,

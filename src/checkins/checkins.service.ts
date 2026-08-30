@@ -5,17 +5,21 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type { QuestionDimension } from '@prisma/client';
+import type { QuestionDimension, ScoreBand } from '@prisma/client';
 import { AuditService } from '../audit/audit.service.js';
 import type { AuthenticatedUser } from '../auth/auth.types.js';
+import { dispatchWebhook } from '../common/webhook.util.js';
 import { GroupsService } from '../groups/groups.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { WebhookConfigService } from '../webhook-config/webhook-config.service.js';
 import {
   addDaysUTC,
   bandFor,
+  buildScoreAlertConcern,
   dateOnlyUTC,
   isoDate,
   resolveDateRange,
+  SCORE_ALERT_THRESHOLD,
   scoreFromPoints,
 } from './checkins.util.js';
 import type { SubmitAnswersDto } from './dto/submit-answers.dto.js';
@@ -38,6 +42,7 @@ export class CheckinsService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly groupsService: GroupsService,
+    private readonly webhookConfig: WebhookConfigService,
   ) {}
 
   private async getTodaysSetNumber(): Promise<number> {
@@ -240,6 +245,10 @@ export class CheckinsService {
       ipAddress: meta.ipAddress,
     });
 
+    if (overallScore < SCORE_ALERT_THRESHOLD) {
+      await this.dispatchScoreAlertWebhook(missionaryId, institutionId, overallScore, dimensionResults);
+    }
+
     return {
       overallScore,
       overallBand,
@@ -247,6 +256,79 @@ export class CheckinsService {
       hasCriticalAlert,
       criticalSupport: hasCriticalAlert ? CRITICAL_SUPPORT_MESSAGE : null,
     };
+  }
+
+  /** Dispara o evento de webhook `score.alert` (score geral abaixo de
+   * SCORE_ALERT_THRESHOLD) — falha de envio não deve derrubar o check-in, só fica
+   * registrada em auditoria. */
+  private async dispatchScoreAlertWebhook(
+    missionaryId: string,
+    institutionId: string,
+    overallScore: number,
+    dimensions: { dimension: QuestionDimension; value: number; band: ScoreBand }[],
+  ) {
+    const endpoint = await this.webhookConfig.getForDispatch('SCORE_ALERT');
+    if (!endpoint || !endpoint.active) return;
+
+    const missionary = await this.prisma.user.findUnique({
+      where: { id: missionaryId },
+      select: { fullName: true, preferredName: true },
+    });
+    if (!missionary) return;
+
+    const memberships = await this.prisma.groupMembership.findMany({
+      where: { missionaryId, status: 'ACTIVE', group: { institutionId } },
+      include: {
+        group: {
+          select: {
+            name: true,
+            leaders: {
+              include: { user: { select: { id: true, fullName: true, email: true, phone: true } } },
+            },
+          },
+        },
+      },
+    });
+
+    // Um missionário pode estar em mais de um grupo (e um grupo pode ter mais
+    // de um líder, ou nenhum) — dedupe por líder e, se houver mais de um,
+    // sorteia um só pra receber o alerta (evita disparar a mesma mensagem
+    // várias vezes).
+    const leadersById = new Map(
+      memberships.flatMap((m) =>
+        m.group.leaders.map((gl) => [gl.user.id, { groupName: m.group.name, ...gl.user }] as const),
+      ),
+    );
+    const leaders = Array.from(leadersById.values());
+    const chosenLeader = leaders.length > 0 ? leaders[Math.floor(Math.random() * leaders.length)] : null;
+
+    const payload = {
+      event: 'score.alert',
+      missionaryId,
+      institutionId,
+      fullName: missionary.fullName,
+      preferredName: missionary.preferredName,
+      overallScore,
+      spheres: dimensions.map((d) => ({ dimension: d.dimension, value: d.value, band: d.band })),
+      concern: buildScoreAlertConcern(overallScore, dimensions),
+      groupName: chosenLeader?.groupName ?? null,
+      leaderName: chosenLeader?.fullName ?? null,
+      leaderPhone: chosenLeader?.phone ?? null,
+      leaderEmail: chosenLeader?.email ?? null,
+      checkinDate: isoDate(dateOnlyUTC()),
+    };
+
+    try {
+      await dispatchWebhook(endpoint.url, payload, endpoint.secret);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Erro desconhecido';
+      await this.audit.log({
+        action: 'checkin.score_alert_webhook.failed',
+        entityType: 'User',
+        entityId: missionaryId,
+        metadata: { error: message },
+      });
+    }
   }
 
   async getStreak(missionaryId: string) {
@@ -476,7 +558,7 @@ export class CheckinsService {
     const memberships = await this.prisma.groupMembership.findMany({
       where: {
         status: 'ACTIVE',
-        group: { leaderId: actor.id, institutionId: { in: leaderInstitutionIds } },
+        group: { leaders: { some: { userId: actor.id } }, institutionId: { in: leaderInstitutionIds } },
       },
       select: { missionaryId: true },
     });
@@ -532,7 +614,7 @@ export class CheckinsService {
     if (!isLeader) return false;
 
     const membership = await this.prisma.groupMembership.findFirst({
-      where: { missionaryId, status: 'ACTIVE', group: { institutionId, leaderId: actor.id } },
+      where: { missionaryId, status: 'ACTIVE', group: { institutionId, leaders: { some: { userId: actor.id } } } },
     });
     return !!membership;
   }
@@ -558,7 +640,7 @@ export class CheckinsService {
 
     const missionary = await this.prisma.user.findUnique({
       where: { id: missionaryId },
-      select: { id: true, fullName: true, preferredName: true, email: true },
+      select: { id: true, fullName: true, preferredName: true, email: true, phone: true },
     });
     if (!missionary) {
       throw new NotFoundException('Missionário não encontrado');
@@ -566,7 +648,15 @@ export class CheckinsService {
 
     const membership = await this.prisma.groupMembership.findFirst({
       where: { missionaryId, status: 'ACTIVE', group: { institutionId } },
-      include: { group: { select: { id: true, name: true, leader: { select: { fullName: true } } } } },
+      include: {
+        group: {
+          select: {
+            id: true,
+            name: true,
+            leaders: { select: { user: { select: { fullName: true } } } },
+          },
+        },
+      },
     });
 
     const checkins = await this.prisma.dailyCheckin.findMany({
@@ -621,7 +711,11 @@ export class CheckinsService {
     return {
       missionary,
       group: membership
-        ? { id: membership.group.id, name: membership.group.name, leaderName: membership.group.leader.fullName }
+        ? {
+            id: membership.group.id,
+            name: membership.group.name,
+            leaderNames: membership.group.leaders.map((l) => l.user.fullName),
+          }
         : null,
       range: { from: isoDate(from), to: isoDate(to) },
       averages: { overallAvg, dimensions: dimensionAverages },
@@ -671,7 +765,7 @@ export class CheckinsService {
         throw new ForbiddenException('Você não pode ver os eventos de cuidado desta instituição');
       }
       const memberships = await this.prisma.groupMembership.findMany({
-        where: { status: 'ACTIVE', group: { institutionId, leaderId: actor.id } },
+        where: { status: 'ACTIVE', group: { institutionId, leaders: { some: { userId: actor.id } } } },
         select: { missionaryId: true },
       });
       missionaryIdFilter = memberships.map((m) => m.missionaryId);

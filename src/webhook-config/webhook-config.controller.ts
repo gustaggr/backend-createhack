@@ -15,12 +15,12 @@ export class WebhookConfigController {
   constructor(private readonly webhookConfigService: WebhookConfigService) {}
 
   @Get()
-  get() {
-    return this.webhookConfigService.get();
+  list() {
+    return this.webhookConfigService.list();
   }
 
   @Put()
   configure(@Body() dto: ConfigureWebhookDto, @CurrentUser() user: AuthenticatedUser) {
-    return this.webhookConfigService.configure(dto.url, user.id);
+    return this.webhookConfigService.configure(dto.event, dto.url, user.id);
   }
 }

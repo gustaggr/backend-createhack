@@ -1,4 +1,4 @@
-import { IsOptional, IsString, MinLength } from 'class-validator';
+import { IsArray, IsOptional, IsString, MinLength } from 'class-validator';
 
 export class CreateGroupDto {
   @IsString()
@@ -13,6 +13,9 @@ export class CreateGroupDto {
   @IsString()
   locality?: string;
 
-  @IsString()
-  leaderId!: string;
+  /** Zero, um ou vários líderes — um grupo pode não ter liderança designada. */
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  leaderIds?: string[];
 }

@@ -13,5 +13,6 @@ export interface AuthenticatedUser {
   email: string;
   fullName: string;
   preferredName: string | null;
+  phone: string | null;
   roles: AuthenticatedUserRole[];
 }

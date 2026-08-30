@@ -1,4 +1,4 @@
-import type { ScoreBand } from '@prisma/client';
+import type { QuestionDimension, ScoreBand } from '@prisma/client';
 
 // Faixas de score (0-100, 100 = melhor) — iguais para o score geral e para
 // cada dimensão. Mantidas isoladas aqui para facilitar ajuste futuro.
@@ -8,6 +8,38 @@ export function bandFor(score: number): ScoreBand {
   if (score >= SCORE_BAND_THRESHOLDS.STABLE) return 'STABLE';
   if (score >= SCORE_BAND_THRESHOLDS.ATTENTION) return 'ATTENTION';
   return 'PRIORITY';
+}
+
+// Limite que dispara o webhook de alerta de score baixo (independente das
+// faixas acima, que também controlam o "needsAttention" do dashboard).
+export const SCORE_ALERT_THRESHOLD = 60;
+
+const DIMENSION_LABELS: Record<QuestionDimension, string> = {
+  PHYSICAL: 'físico',
+  EMOTIONAL: 'emocional',
+  SPIRITUAL: 'espiritual',
+  MINISTRY: 'ministerial',
+  RELATIONAL: 'relacional',
+};
+
+/** Monta a mensagem de "o que o líder precisa olhar agora" para o webhook de
+ * alerta de score baixo, priorizando as esferas em pior situação. */
+export function buildScoreAlertConcern(
+  overallScore: number,
+  dimensions: { dimension: QuestionDimension; value: number; band: ScoreBand }[],
+): string {
+  const priority = dimensions.filter((d) => d.band === 'PRIORITY').sort((a, b) => a.value - b.value);
+  const attention = dimensions.filter((d) => d.band === 'ATTENTION').sort((a, b) => a.value - b.value);
+
+  if (priority.length > 0) {
+    const names = priority.map((d) => DIMENSION_LABELS[d.dimension]).join(', ');
+    return `Score geral em ${overallScore} (abaixo de ${SCORE_ALERT_THRESHOLD}). Esfera(s) em prioridade de cuidado: ${names}. O líder deve procurar este missionário hoje.`;
+  }
+  if (attention.length > 0) {
+    const names = attention.map((d) => DIMENSION_LABELS[d.dimension]).join(', ');
+    return `Score geral em ${overallScore} (abaixo de ${SCORE_ALERT_THRESHOLD}). Esfera(s) em atenção: ${names}. Vale uma conversa próxima nos próximos dias.`;
+  }
+  return `Score geral em ${overallScore} (abaixo de ${SCORE_ALERT_THRESHOLD}). Vale uma conversa de acompanhamento com o missionário.`;
 }
 
 /** 100 − (soma dos pontos / (3 × nº de perguntas)) × 100, arredondado. */
